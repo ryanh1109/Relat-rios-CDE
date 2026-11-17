@@ -5,6 +5,33 @@ from datetime import datetime
 
 UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 METADATA_FILE = os.path.join(UPLOADS_DIR, "metadata.json")
+BUCKET_NAME = "planilhas"
+
+def get_supabase_client():
+    """Retrieve Supabase client if configured in Streamlit Secrets or Environment Variables."""
+    supabase_url = None
+    supabase_key = None
+
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            supabase_url = st.secrets.get("SUPABASE_URL")
+            supabase_key = st.secrets.get("SUPABASE_KEY")
+    except Exception:
+        pass
+
+    if not supabase_url:
+        supabase_url = os.environ.get("SUPABASE_URL")
+    if not supabase_key:
+        supabase_key = os.environ.get("SUPABASE_KEY")
+
+    if supabase_url and supabase_key:
+        try:
+            from supabase import create_client
+            return create_client(supabase_url, supabase_key)
+        except Exception:
+            return None
+    return None
 
 def ensure_uploads_dir():
     """Ensure the uploads folder exists."""
@@ -12,24 +39,77 @@ def ensure_uploads_dir():
         os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 def load_metadata():
-    """Load metadata dictionary from JSON file."""
+    """Load metadata dictionary from local JSON file or Supabase Storage."""
     ensure_uploads_dir()
+    
+    # 1. Tenta carregar do disco local
     if os.path.exists(METADATA_FILE):
         try:
             with open(METADATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return {}
+            pass
+
+    # 2. Se não existir localmente, tenta restaurar do Supabase Storage
+    client = get_supabase_client()
+    if client:
+        try:
+            meta_bytes = client.storage.from_(BUCKET_NAME).download("metadata.json")
+            if meta_bytes:
+                data = json.loads(meta_bytes.decode("utf-8"))
+                with open(METADATA_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return data
+        except Exception:
+            pass
+
     return {}
 
 def save_metadata(data):
-    """Save metadata dictionary to JSON file."""
+    """Save metadata dictionary to local JSON file and sync with Supabase Storage."""
     ensure_uploads_dir()
+    meta_json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    
+    # Salva localmente
     with open(METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write(meta_json_str)
+
+    # Sincroniza com Supabase Storage
+    client = get_supabase_client()
+    if client:
+        try:
+            client.storage.from_(BUCKET_NAME).upload(
+                path="metadata.json",
+                file=meta_json_str.encode("utf-8"),
+                file_options={"upsert": "true", "content-type": "application/json"}
+            )
+        except Exception:
+            pass
+
+def ensure_file_restored_from_cloud(file_key):
+    """If file does not exist locally (e.g. app rebooted or woke up), fetch it from Supabase Storage."""
+    ensure_uploads_dir()
+    target_path = os.path.join(UPLOADS_DIR, f"{file_key}.xlsx")
+    if os.path.exists(target_path):
+        return True
+
+    client = get_supabase_client()
+    if client:
+        try:
+            remote_path = f"{file_key}.xlsx"
+            file_bytes = client.storage.from_(BUCKET_NAME).download(remote_path)
+            if file_bytes:
+                with open(target_path, "wb") as f:
+                    f.write(file_bytes)
+                # Garante que os metadados também sejam recarregados
+                load_metadata()
+                return True
+        except Exception:
+            return False
+    return False
 
 def save_file(uploaded_file, file_key):
-    """Save an uploaded file to disk and record metadata."""
+    """Save an uploaded file to disk and sync with Supabase Storage."""
     ensure_uploads_dir()
     target_path = os.path.join(UPLOADS_DIR, f"{file_key}.xlsx")
     
@@ -48,13 +128,30 @@ def save_file(uploaded_file, file_key):
         "path": target_path
     }
     save_metadata(meta)
+
+    # Envia para a nuvem do Supabase
+    client = get_supabase_client()
+    if client:
+        try:
+            remote_path = f"{file_key}.xlsx"
+            client.storage.from_(BUCKET_NAME).upload(
+                path=remote_path,
+                file=file_bytes,
+                file_options={"upsert": "true", "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+            )
+        except Exception:
+            pass
+
     return target_path
 
 def get_file_info(file_key):
-    """Get status and info of saved file."""
+    """Get status and info of saved file, checking local disk and restoring from Supabase if needed."""
     target_path = os.path.join(UPLOADS_DIR, f"{file_key}.xlsx")
     if not os.path.exists(target_path):
-        return None
+        restored = ensure_file_restored_from_cloud(file_key)
+        if not restored:
+            return None
+
     meta = load_metadata()
     info = meta.get(file_key, {})
     return {
@@ -66,23 +163,32 @@ def get_file_info(file_key):
     }
 
 def delete_file(file_key):
-    """Delete a saved file from disk."""
+    """Delete a saved file from disk and remove from Supabase Storage."""
     target_path = os.path.join(UPLOADS_DIR, f"{file_key}.xlsx")
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
         except Exception:
             pass
+
     meta = load_metadata()
     if file_key in meta:
         del meta[file_key]
         save_metadata(meta)
 
+    # Exclui do Supabase Storage
+    client = get_supabase_client()
+    if client:
+        try:
+            client.storage.from_(BUCKET_NAME).remove([f"{file_key}.xlsx"])
+        except Exception:
+            pass
+
 def get_effective_file(uploaded_file, file_key):
     """
     Returns filepath for processing.
     If uploaded_file is provided, saves it first and returns filepath.
-    Otherwise, returns path to saved file if it exists.
+    Otherwise, returns path to saved file if it exists (or restores from cloud).
     """
     if uploaded_file is not None:
         return save_file(uploaded_file, file_key)
@@ -114,4 +220,3 @@ def get_effective_cadastro_excesso(uploaded_exclusive=None):
         return info_shared["path"], "shared", info_shared
 
     return None, "none", None
-
